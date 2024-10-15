@@ -1,0 +1,29 @@
+version: 1
+{% if distro.startswith("alma") %}
+config:
+  - type: physical
+    name: eth0
+    subnets:
+      - address: {{ ip4 }}/32
+        gateway: 141.70.124.10
+        type: static
+        dns_nameservers:
+          - 141.70.124.4
+        dns_search:
+          - server.selfnet.de
+          - lan.selfnet.de
+        routes:
+           - destination: 141.70.124.10/32
+             gateway: 0.0.0.0
+      - address: {{ ip6 }}/128
+        gateway: 2001:7c7:2100::1
+        type: static6
+        dns_nameservers:
+          - 2001:7c7:2100::532
+        routes:
+          - destination: 2001:7c7:2100::1/128
+            gateway: '::'
+{% else %}
+config:
+  disabled
+{% endif %}

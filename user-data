@@ -1,0 +1,115 @@
+#cloud-config
+
+users:
+  - name: root
+    ssh_authorized_keys:
+{% for ssh_key in ssh_keys %}
+     - {{ ssh_key }}
+{% endfor %}
+
+chpasswd:
+  list: |
+     root:{{ root_password }}
+  expire: False
+
+fqdn: {{ hostname }}.server.selfnet.de
+
+packages:
+ - nftables
+ - eject
+
+runcmd:
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, nftables.service ]
+  - [ systemctl, start, nftables.service ]
+  - [ rm, /etc/default/grub.d/15_timeout.cfg ]
+  - [ update-grub ]
+  - [ eject ]
+write_files:
+{% if distro == "debian-12" %}
+ - content: |
+    [Match]
+    Name=ens3
+
+    [Network]
+    Address={{ ip4 }}/32
+    Gateway=141.70.124.10
+    DNS=141.70.124.4
+    Domains=server.selfnet.de lan.selfnet.de
+
+    [Route]
+    Destination=141.70.124.10/32
+    Scope=link
+
+    [Network]
+    Address={{ ip6 }}/128
+    Gateway=2001:7c7:2100::1
+    DNS=2001:7c7:2100::532
+
+    [Route]
+    Destination=2001:7c7:2100::1/128
+    Scope=link
+   path: /etc/systemd/network/vm.network
+{% elif distro.startswith("debian") %}
+ - content: |
+    source /etc/network/interfaces.d/*
+
+    # The loopback network interface
+    auto lo
+    iface lo inet loopback
+
+    # The primary network interface
+    auto ens3
+    iface ens3 inet static
+    address {{ ip4 }}/32
+    post-up ip route add 141.70.124.10 dev ens3
+    post-up ip route add default via 141.70.124.10
+
+    iface ens3 inet6 static
+    address {{ ip6 }}/128
+    post-up ip route add 2001:7c7:2100::1 dev ens3
+    post-up ip route add default via 2001:7c7:2100::1
+   path: /etc/network/interfaces
+ - content: |
+    search server.selfnet.de lan.selfnet.de
+    nameserver 141.70.124.4
+
+    nameserver 2001:7c7:2100::532
+   path: /etc/resolv.conf
+{% endif %}
+{% if distro.startswith("alma") %}
+ - content : 'include "/etc/nftables.conf";'
+   path: /etc/sysconfig/nftables.conf
+{% endif %}
+ - content : |
+    #!/usr/sbin/nft -f
+
+    flush ruleset
+
+    table inet firewall {
+            chain input {
+                    type filter hook input priority 0; policy drop;
+                    ct state established,related accept
+                    ct state invalid drop
+                    iif "lo" accept
+                    ip6 nexthdr ipv6-icmp accept
+                    ip protocol icmp accept
+                    tcp dport ssh jump ssh
+                    reject
+            }
+
+            chain forward {
+                    type filter hook forward priority 0; policy drop;
+            }
+
+            chain output {
+                    type filter hook output priority 0; policy accept;
+            }
+
+            chain ssh {
+                    ip saddr { 141.70.126.251, 141.70.127.251, 141.70.127.59} accept #login-{1,2,3}
+                    ip6 saddr { 2001:7c7:2100:700::1, 2001:7c7:2100:701::1, 2001:7c7:2100:401::35 } accept #login-{1,2,3}
+            }
+    }
+   path: /etc/nftables.conf
+

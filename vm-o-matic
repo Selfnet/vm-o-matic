@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+import subprocess
+import glob
+from sys import argv
+from socket import getaddrinfo
+from string import Template
+from pathlib import Path
+from util import (
+    temp_dir,
+    log,
+    mount,
+    get_part_uuid,
+    write_to_file,
+    replace_lines_matching,
+)
+from disks import Ceph_Disk, QEMU_Disk
+import templates
+import argparse
+import xml.etree.ElementTree as ET
+import shutil
+from jinja2 import Environment, FileSystemLoader
+import os.path
+import crypt
+import getpass
+
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument(
+    "vm_name", help="Name of the new VM, will be used for the disk as well"
+)
+parser.add_argument(
+    "-s", "--size", type=float, help="Size of the disk in GB", default=11
+)
+parser.add_argument(
+    "--dns", help="use dns to get the ip addresses", action="store_true", required=False
+)
+parser.add_argument(
+    "-i", "--ip4", type=str, help="IPv4 address", required="--dns" not in argv
+)
+parser.add_argument(
+    "-j", "--ip6", type=str, help="IPv6 address", required="--dns" not in argv
+)
+parser.add_argument(
+    "-x", "--use-existing", help="Use and overwrite existing disk", action="store_true"
+)
+parser.add_argument(
+    "-o",
+    "--only-definition",
+    help="Only create defintion, don't create disk",
+    action="store_true",
+)
+parser.add_argument(
+    "-q",
+    "--qemu",
+    help="Create a local qemu image instead of using ceph",
+    action="store_true",
+)
+parser.add_argument(
+    "--qemu-path",
+    type=str,
+    help="The directory to store the disk image",
+    required=("-q" in argv) or ("--qemu" in argv),
+)
+parser.add_argument(
+    "-n",
+    "--no-bgp",
+    help="Use a 'classical' bridge network definition without the bgp setup",
+    action="store_true",
+)
+parser.add_argument(
+    "--bridge",
+    type=str,
+    help="The name of the bridge on the host",
+    required=("-n" in argv) or ("--no-bgp" in argv),
+)
+parser.add_argument(
+    "--domain",
+    type=str,
+    help="The domain name to use for the host",
+    default="server.selfnet.de",
+)
+parser.add_argument(
+    "--distro",
+    type=str,
+    help="The distro to install",
+    default="debian-12",
+)
+parser.add_argument(
+    "--ceph-pool",
+    type=str,
+    help="The name of the ceph-pool for the disks",
+    default="vms",
+)
+parser.add_argument(
+    "--ceph-id",
+    type=str,
+    help="The name of the ceph-id to use (ls /etc/ceph)",
+    default="libvirt",
+)
+parser.add_argument(
+    "--virsh-secret-uuid",
+    type=str,
+    help="The uuid of the ceph secret in virsh (virsh secret-list)",
+    default="2aa2f5c8-a179-4d8c-b0ee-bdc9f830ab33",
+)
+parser.add_argument(
+    "--ldap-user-ssh-keys",
+    type=str,
+    help="Add SSH keys of this LDAP user to the root authorized_keys file",
+    action='append',
+)
+args = parser.parse_args()
+
+ssh_keys = []
+if args.ldap_user_ssh_keys:
+    for user in args.ldap_user_ssh_keys:
+        user_keys = subprocess.check_output(["sss_ssh_authorizedkeys", user]).decode("utf-8")
+        log("Collected {} SSH keys from LDAP for user {}.".format(
+            user_keys.count('\n'), user))
+        ssh_keys += user_keys.splitlines()
+
+if args.dns:
+    try:
+        log("trying to get ips from dns")
+        fqdn = f"{args.vm_name}.{args.domain}"
+        ips = {x[4][0] for x in getaddrinfo(fqdn, 1337)}
+        for ip in ips:
+            if ":" in ip:
+                ip6 = ip
+            else:
+                ip4 = ip
+        if ip4 is None or ip6 is None:
+            raise
+        log("got ips from dns")
+    except:
+        exit("couldn't get ips from dns please provide them manually with -i and -j")
+else:
+    ip4 = args.ip4
+    ip6 = args.ip6
+
+log(f"IPv4: {ip4}\nIPv6: {ip6}")
+
+root_password = getpass.getpass()
+
+rbd_args = [f"--id={args.ceph_id}",  "-k", f"/etc/ceph/ceph.client.{args.ceph_id}.keyring"]
+
+env = Environment(loader=FileSystemLoader(os.path.dirname(__file__)), trim_blocks=True)
+
+if not args.only_definition:
+    with temp_dir() as iso_tmp :
+        iso_tmp = Path(iso_tmp)
+
+        meta_template = env.get_template("meta-data")
+        with open(iso_tmp / "meta-data", "w") as fi :
+            fi.write(meta_template.render(hostname = args.vm_name))
+
+        user_data_template = env.get_template("user-data")
+        user_vars = {
+            "ssh_keys": ssh_keys,
+            "hostname": args.vm_name,
+            "ip4": ip4,
+            "ip6": ip6,
+            "root_password": crypt.crypt(root_password),
+            "distro": args.distro
+        }
+        with open(iso_tmp / "user-data", "w") as fi :
+            fi.write(user_data_template.render(**user_vars))
+
+        network_config_template = env.get_template("network-config")
+        user_vars = {
+            "ip4": ip4,
+            "ip6": ip6,
+            "distro": args.distro
+        }
+        with open(iso_tmp / "network-config", "w") as fi :
+            fi.write(network_config_template.render(**user_vars))
+
+        filenames = [str(iso_tmp / x) for x in  ["meta-data", "user-data", "network-config"]]
+        subprocess.run(["genisoimage", "-output", f"/tmp/{args.vm_name}.iso", "-volid", "cidata", "-joliet", "-rock", *filenames], check=True)
+
+    if args.qemu:
+        subprocess.run(["qemu-img", "convert", "-p", f"rbd:vms/{args.distro}-genericcloud-amd64-daily:id=libvirt:keyring=/etc/ceph/ceph.client.libvirt.keyring", "-O", "qcow2",  args.qemu_path], check=True)
+        subprocess.run(["qemu-img", "resize", args.qemu_path, f"{args.size}G"], check=True)
+    else :
+        disk_name = f"vms/{args.vm_name}"
+        subprocess.run(
+            ["rbd", "cp", *rbd_args,
+             f"vms/{args.distro}-genericcloud-amd64-daily",
+             disk_name],
+             check=True)
+        subprocess.run(["rbd", "resize", "-s", f"{args.size}G", *rbd_args, disk_name], check=True)
+
+log(f"writing defintion to {args.vm_name}.xml")
+if args.no_bgp:
+    with open(f"{args.vm_name}.xml", "w") as libvirt_definition:
+        libvirt_definition.write(
+            Template(templates.libvirt_definition).substitute(
+                hostname=args.vm_name,
+                memory=4194304,
+                cpu=4,
+                vm_disk=args.qemu_path + args.vm_name,
+                bridge=args.bridge,
+            )
+        )
+else:
+    tree = ET.parse(Path(__file__).parent / "template.xml")
+    ET.register_namespace("bgp", "http://selfnet.de")
+    root = tree.getroot()
+
+    root.find("name").text = args.vm_name
+    ips = root.find("metadata/{http://selfnet.de}net")
+    ET.SubElement(ips, "ip").text = ip4
+    ET.SubElement(ips, "ip").text = ip6
+    root.find("devices/disk[@type='network']/source").attrib[
+        "name"
+    ] = f"{args.ceph_pool}/{args.vm_name}"
+    root.find("devices/disk[@type='network']/auth").attrib["username"] = args.ceph_id
+    root.find("devices/disk[@type='network']/auth/secret").attrib[
+        "uuid"
+    ] = args.virsh_secret_uuid
+
+    ifname = f"vm_{args.vm_name}"
+    while len(ifname) > 15:
+        print(f"interface name {ifname} too long (15 chars), please enter")
+        ifname = f"vm_{input('> vm_')}"
+
+    root.find("devices/interface[@type='ethernet']/target").attrib["dev"] = ifname
+
+    tree.write(f"{args.vm_name}.xml")
+
+print(Template(templates.sudo_ldap).substitute(hostname=args.vm_name, ip4=ip4, ip6=ip6))
+
+print("run this command to define and start the vm\n")
+print(f"sudo vm-o-matic-create-vm {args.vm_name}")
+
+log("that's it")

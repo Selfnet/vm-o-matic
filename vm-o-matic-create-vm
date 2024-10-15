@@ -1,0 +1,18 @@
+#!/bin/bash
+set -euo pipefail
+virsh define $1.xml
+virsh start --paused $1
+virsh change-media $1 hdc /tmp/$1.iso
+virsh resume $1
+
+while true
+do
+if virsh qemu-monitor-command $1 --cmd '{"execute": "query-block"}'  | jq -e '.return | .[] | select(.tray_open == true)' > /dev/null; then
+    echo "VM ist fertig"
+    virsh change-media $1 hdc --eject
+    break
+else
+    echo "VM noch nicht fertig..."
+fi
+sleep 5
+done
